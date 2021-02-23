@@ -842,11 +842,11 @@ func (d *Driver) Remove(ctx context.Context, info *types.ClusterInfo) error {
 }
 
 func GetTokenSource(ctx context.Context, credential string) (oauth2.TokenSource, error) {
-	ts, err := google.CredentialsFromJSON(ctx, []byte(credential), raw.CloudPlatformScope)
+	ts, err := google.JWTConfigFromJSON([]byte(credential), raw.CloudPlatformScope)
 	if err != nil {
 		return nil, err
 	}
-	return ts.TokenSource, nil
+	return ts.TokenSource(ctx), nil
 }
 
 func getServiceClientWithTokenSource(ctx context.Context, ts oauth2.TokenSource) (*raw.Service, error) {
