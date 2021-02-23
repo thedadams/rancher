@@ -39,12 +39,12 @@ func validateCapabilitiesRequestBody(writer http.ResponseWriter, body *capabilit
 }
 
 func getOAuthClient(ctx context.Context, credentialContent string) (*http.Client, error) {
-	ts, err := google.CredentialsFromJSON(ctx, []byte(credentialContent), container.CloudPlatformScope)
+	ts, err := google.JWTConfigFromJSON([]byte(credentialContent), container.CloudPlatformScope)
 	if err != nil {
 		return nil, err
 	}
 
-	return oauth2.NewClient(ctx, ts.TokenSource), nil
+	return oauth2.NewClient(ctx, ts.TokenSource(ctx)), nil
 }
 
 func handleErr(writer http.ResponseWriter, originalErr error) {
