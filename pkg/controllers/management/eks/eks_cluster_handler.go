@@ -37,6 +37,7 @@ import (
 	typesDialer "github.com/rancher/rancher/pkg/types/config/dialer"
 	"github.com/rancher/rancher/pkg/wrangler"
 	wranglerv1 "github.com/rancher/wrangler/pkg/generated/controllers/core/v1"
+	"github.com/rancher/wrangler/pkg/randomtoken"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -62,6 +63,7 @@ const (
 	localCluster        = "local"
 	enqueueTime         = time.Second * 5
 	importedAnno        = "eks.cattle.io/imported"
+	importCommandURL    = "%s/v3/import/%s_%s.yaml"
 )
 
 type eksOperatorValues struct {
@@ -74,11 +76,13 @@ type eksOperatorController struct {
 	clusterEnqueueAfter  func(name string, duration time.Duration)
 	secretsCache         wranglerv1.SecretCache
 	templateCache        v3.CatalogTemplateCache
+	settingsCache        v3.SettingCache
 	projectCache         v3.ProjectCache
 	appLister            projectv3.AppLister
 	appClient            projectv3.AppInterface
 	nsClient             corev1.NamespaceInterface
 	clusterClient        v3.ClusterClient
+	clusterRegToken      v3.ClusterRegistrationTokenClient
 	catalogManager       manager.CatalogManager
 	systemAccountManager *systemaccount.Manager
 	dynamicClient        dynamic.NamespaceableResourceInterface
@@ -97,11 +101,13 @@ func Register(ctx context.Context, wContext *wrangler.Context, mgmtCtx *config.M
 		clusterEnqueueAfter:  wContext.Mgmt.Cluster().EnqueueAfter,
 		secretsCache:         wContext.Core.Secret().Cache(),
 		templateCache:        wContext.Mgmt.CatalogTemplate().Cache(),
+		settingsCache:        wContext.Mgmt.Setting().Cache(),
 		projectCache:         wContext.Mgmt.Project().Cache(),
 		appLister:            mgmtCtx.Project.Apps("").Controller().Lister(),
 		appClient:            mgmtCtx.Project.Apps(""),
 		nsClient:             mgmtCtx.Core.Namespaces(""),
 		clusterClient:        wContext.Mgmt.Cluster(),
+		clusterRegToken:      wContext.Mgmt.ClusterRegistrationToken(),
 		catalogManager:       mgmtCtx.CatalogManager,
 		systemAccountManager: systemaccount.NewManager(mgmtCtx),
 		dynamicClient:        eksCCDynamicClient,
@@ -180,7 +186,7 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 	// check for changes between EKS spec on cluster and the EKS spec on the EKSClusterConfig object
 	if !reflect.DeepEqual(eksClusterConfigMap, eksClusterConfigDynamic.Object["spec"]) {
 		logrus.Infof("change detected for cluster [%s], updating EKSClusterConfig", cluster.Name)
-		return e.updateEKSClusterConfig(cluster, eksClusterConfigDynamic, eksClusterConfigMap)
+		return e.updateEKSClusterConfig(cluster, eksClusterConfigDynamic, "spec", eksClusterConfigMap)
 	}
 
 	// get EKS Cluster Config's phase
@@ -263,6 +269,30 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 			return cluster, err
 		}
 
+		clusterLaunchTemplateID, _ := status["managedLaunchTemplateID"].(string)
+		if clusterLaunchTemplateID != "" && cluster.Status.EKSStatus.ManagedLaunchTemplateID != clusterLaunchTemplateID {
+			cluster = cluster.DeepCopy()
+			cluster.Status.EKSStatus.ManagedLaunchTemplateID = clusterLaunchTemplateID
+			cluster, err = e.clusterClient.Update(cluster)
+			if err != nil {
+				return cluster, err
+			}
+		}
+
+		managedLaunchTemplateVersions, _ := status["managedLaunchTemplateVersions"].(map[string]interface{})
+		if !reflect.DeepEqual(cluster.Status.EKSStatus.ManagedLaunchTemplateVersions, managedLaunchTemplateVersions) {
+			managedLaunchTemplateVersionsToString := make(map[string]string, len(managedLaunchTemplateVersions))
+			for key, value := range managedLaunchTemplateVersions {
+				managedLaunchTemplateVersionsToString[key] = value.(string)
+			}
+			cluster.DeepCopy()
+			cluster.Status.EKSStatus.ManagedLaunchTemplateVersions = managedLaunchTemplateVersionsToString
+			cluster, err = e.clusterClient.Update(cluster)
+			if err != nil {
+				return cluster, err
+			}
+		}
+
 		// If there are no subnets it can be assumed that networking fields are not provided. In which case they
 		// should be created by the eks-operator, and needs to be copied to the cluster object.
 		if len(cluster.Status.EKSStatus.Subnets) == 0 {
@@ -308,6 +338,12 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 			}
 		}
 
+		eksConfigMetadata, _ := eksClusterConfigDynamic.Object["metadata"].(map[string]interface{})
+		eksConfigAnnotations, ok := eksConfigMetadata["annotations"].(map[string]interface{})
+		if !ok {
+			eksConfigAnnotations = make(map[string]interface{})
+		}
+
 		if cluster.Status.ServiceAccountToken == "" {
 			cluster, err = e.generateAndSetServiceAccount(cluster)
 			if err != nil {
@@ -315,10 +351,22 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 				if strings.Contains(err.Error(), fmt.Sprintf(dialer.WaitForAgentError, cluster.Name)) {
 					// In this case, the API endpoint is private and rancher is waiting for the import cluster command to be run.
 					cluster, statusErr = e.setUnknown(cluster, apimgmtv3.ClusterConditionWaiting, "waiting for cluster agent to be deployed")
-					if statusErr == nil {
-						e.clusterEnqueueAfter(cluster.Name, enqueueTime)
+					if statusErr != nil {
+						return cluster, statusErr
 					}
-					return cluster, statusErr
+					if eksConfigAnnotations[controller.DeployAgentURLKey] != nil {
+						e.clusterEnqueueAfter(cluster.Name, enqueueTime)
+						return cluster, nil
+					}
+
+					agentDeployURL, err := e.generateClusterDeployURL(cluster)
+					if err != nil {
+						return cluster, err
+					}
+					logrus.Infof("adding deployment URL for cluster [%s] to EKSConfig annotations", cluster.Name)
+					eksConfigAnnotations[controller.DeployAgentURLKey] = agentDeployURL
+					eksConfigMetadata["annotations"] = eksConfigAnnotations
+					return e.updateEKSClusterConfig(cluster, eksClusterConfigDynamic, "metadata", eksConfigMetadata)
 				}
 				cluster, statusErr = e.setFalse(cluster, apimgmtv3.ClusterConditionWaiting,
 					fmt.Sprintf("failed to communicate with cluster: %v", err))
@@ -329,28 +377,10 @@ func (e *eksOperatorController) onClusterChange(key string, cluster *mgmtv3.Clus
 			}
 		}
 
-		clusterLaunchTemplateID, _ := status["managedLaunchTemplateID"].(string)
-		if clusterLaunchTemplateID != "" && cluster.Status.EKSStatus.ManagedLaunchTemplateID != clusterLaunchTemplateID {
-			cluster = cluster.DeepCopy()
-			cluster.Status.EKSStatus.ManagedLaunchTemplateID = clusterLaunchTemplateID
-			cluster, err = e.clusterClient.Update(cluster)
-			if err != nil {
-				return cluster, err
-			}
-		}
-
-		managedLaunchTemplateVersions, _ := status["managedLaunchTemplateVersions"].(map[string]interface{})
-		if !reflect.DeepEqual(cluster.Status.EKSStatus.ManagedLaunchTemplateVersions, managedLaunchTemplateVersions) {
-			managedLaunchTemplateVersionsToString := make(map[string]string, len(managedLaunchTemplateVersions))
-			for key, value := range managedLaunchTemplateVersions {
-				managedLaunchTemplateVersionsToString[key] = value.(string)
-			}
-			cluster.DeepCopy()
-			cluster.Status.EKSStatus.ManagedLaunchTemplateVersions = managedLaunchTemplateVersionsToString
-			cluster, err = e.clusterClient.Update(cluster)
-			if err != nil {
-				return cluster, err
-			}
+		if eksConfigAnnotations[controller.DeployAgentURLKey] != nil {
+			delete(eksConfigAnnotations, controller.DeployAgentURLKey)
+			eksConfigMetadata["annotations"] = eksConfigAnnotations
+			return e.updateEKSClusterConfig(cluster, eksClusterConfigDynamic, "metadata", eksConfigMetadata)
 		}
 
 		cluster, err = e.recordAppliedSpec(cluster)
@@ -413,7 +443,7 @@ func (e *eksOperatorController) setInitialUpstreamSpec(cluster *mgmtv3.Cluster) 
 }
 
 // updateEKSClusterConfig updates the EKSClusterConfig object's spec with the cluster's EKSConfig if they are not equal..
-func (e *eksOperatorController) updateEKSClusterConfig(cluster *mgmtv3.Cluster, eksClusterConfigDynamic *unstructured.Unstructured, spec map[string]interface{}) (*mgmtv3.Cluster, error) {
+func (e *eksOperatorController) updateEKSClusterConfig(cluster *mgmtv3.Cluster, eksClusterConfigDynamic *unstructured.Unstructured, key string, value map[string]interface{}) (*mgmtv3.Cluster, error) {
 	list, err := e.dynamicClient.Namespace(namespace.GlobalNamespace).List(context.TODO(), v1.ListOptions{})
 	if err != nil {
 		return cluster, err
@@ -423,7 +453,7 @@ func (e *eksOperatorController) updateEKSClusterConfig(cluster *mgmtv3.Cluster, 
 	if err != nil {
 		return cluster, err
 	}
-	eksClusterConfigDynamic.Object["spec"] = spec
+	eksClusterConfigDynamic.Object[key] = value
 	eksClusterConfigDynamic, err = e.dynamicClient.Namespace(namespace.GlobalNamespace).Update(context.TODO(), eksClusterConfigDynamic, v1.UpdateOptions{})
 	if err != nil {
 		return cluster, err
@@ -790,4 +820,33 @@ func generateValuesYaml() (string, error) {
 	}
 
 	return string(valuesYaml), nil
+}
+
+func (e *eksOperatorController) generateClusterDeployURL(cluster *mgmtv3.Cluster) (string, error) {
+	tokens, err := e.clusterRegToken.List(cluster.Name, v1.ListOptions{})
+	if err != nil {
+		return "", err
+	}
+	regToken := &apimgmtv3.ClusterRegistrationToken{
+		ObjectMeta: v1.ObjectMeta{Namespace: cluster.Name, GenerateName: "crt-"},
+		Spec:       apimgmtv3.ClusterRegistrationTokenSpec{ClusterName: cluster.Name},
+	}
+	if len(tokens.Items) == 0 {
+		regToken.Status.Token, err = randomtoken.Generate()
+		if err != nil {
+			return "", err
+		}
+		regToken, err = e.clusterRegToken.Create(regToken)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		regToken = &tokens.Items[0]
+	}
+
+	serverURL, err := e.settingsCache.Get("server-url")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf(importCommandURL, serverURL.Value, regToken.Status.Token, cluster.Name), nil
 }
