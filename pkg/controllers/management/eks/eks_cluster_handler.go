@@ -6,6 +6,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -667,6 +668,10 @@ func (e *eksOperatorController) generateSATokenWithPublicAPI(cluster *mgmtv3.Clu
 	if err != nil {
 		var dnsError *net.DNSError
 		if stderrors.As(err, &dnsError) && !dnsError.IsTemporary {
+			return "", aws.Bool(true), nil
+		}
+		var urlError *url.Error
+		if stderrors.As(err, &urlError) && urlError.Timeout() && !aws.BoolValue(cluster.Spec.EKSConfig.PublicAccess) {
 			return "", aws.Bool(true), nil
 		}
 	} else {
