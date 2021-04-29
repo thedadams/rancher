@@ -460,18 +460,14 @@ func validateEKSKubernetesVersion(spec *v32.ClusterSpec, prevCluster *v3.Cluster
 // they are overwriting. If there is no previous credential such as during a create or the old credential cannot
 // be found, the auth check will succeed as long as the user can access the new credential.
 func validateEKSCredentialAuth(request *types.APIContext, credential string, prevCluster *v3.Cluster) error {
+	if prevCluster == nil || prevCluster.Spec.EKSConfig == nil || credential == prevCluster.Spec.EKSConfig.AmazonCredentialSecret {
+		return nil
+	}
+
 	var accessCred mgmtclient.CloudCredential
 	credentialErr := "error accessing cloud credential"
 	if err := access.ByID(request, &mgmtSchema.Version, mgmtclient.CloudCredentialType, credential, &accessCred); err != nil {
 		return httperror.NewAPIError(httperror.NotFound, credentialErr)
-	}
-
-	if prevCluster == nil {
-		return nil
-	}
-
-	if prevCluster.Spec.EKSConfig == nil {
-		return nil
 	}
 
 	// validate the user has access to the old cloud credential before allowing them to change it
@@ -602,18 +598,14 @@ func (v *Validator) validateGKEConfig(request *types.APIContext, cluster map[str
 // they are overwriting. If there is no previous credential such as during a create or the old credential cannot
 // be found, the auth check will succeed as long as the user can access the new credential.
 func validateGKECredentialAuth(request *types.APIContext, credential string, prevCluster *v3.Cluster) error {
+	if prevCluster == nil || prevCluster.Spec.GKEConfig == nil || credential == prevCluster.Spec.GKEConfig.GoogleCredentialSecret {
+		return nil
+	}
+
 	var accessCred mgmtclient.CloudCredential
 	credentialErr := "error accessing cloud credential"
 	if err := access.ByID(request, &mgmtSchema.Version, mgmtclient.CloudCredentialType, credential, &accessCred); err != nil {
 		return httperror.NewAPIError(httperror.NotFound, credentialErr)
-	}
-
-	if prevCluster == nil {
-		return nil
-	}
-
-	if prevCluster.Spec.GKEConfig == nil {
-		return nil
 	}
 
 	// validate the user has access to the old cloud credential before allowing them to change it
